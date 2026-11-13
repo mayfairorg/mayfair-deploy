@@ -1,0 +1,3 @@
+# Targets that may be deployed to production. One folder of mayfair per line.
+# Empty on purpose: nothing can be deployed until the owner adds a line.
+# Add a line only after the target has deployed to staging by the pipeline and the owner has read its evidence.
