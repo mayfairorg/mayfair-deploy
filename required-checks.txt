@@ -1,0 +1,9 @@
+# Check run names in mayfair that must have passed on a commit before it can go to production.
+# Final names fixed by S12 (OD204). The owner copies this list into mayfair-deploy when the S12 pull request is merged.
+# The first line is the job name of the Z31 push check in mayfair; the next five are the jobs of .github/workflows/ci.yml.
+check
+tests
+drift
+scans
+workflow-rules
+task-rules
