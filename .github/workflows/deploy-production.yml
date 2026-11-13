@@ -1,0 +1,185 @@
+# Mayfair production deploy and rollback (OD190, OD192).
+# This file lives only in the public repository mayfairorg/mayfair-deploy. It is written in mayfair under deploy/
+# and added to mayfair-deploy by the owner. Claude never attaches mayfair-deploy and never holds its secrets.
+#
+# How it is protected:
+#  * It starts only by hand (workflow_dispatch) from main of mayfair-deploy.
+#  * The deploy job uses the environment "production": the owner approves it and a 10 minute wait timer runs
+#    before any secret is released (Z2 cool off). The environment is limited to main and bypass is off.
+#  * Secrets exist only in that environment: MAYFAIR_READ_TOKEN (read only, one repository), CF_PROD_API_TOKEN
+#    (one Cloudflare account, least permissions) and the variable CF_PROD_ACCOUNT_ID.
+#  * Inputs reach scripts only through env variables, never inside script text.
+#  * No third party actions. The target must be listed in targets.txt, and every check named in
+#    required-checks.txt must have passed on the commit, which must be on main of mayfair and have come in by a
+#    merged pull request.
+name: deploy-production
+run-name: production ${{ inputs.action }} ${{ inputs.target }} ${{ inputs.commit }}
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: deploy or rollback
+        type: choice
+        options: [deploy, rollback]
+        default: deploy
+        required: true
+      commit:
+        description: Full 40 character commit of mayfair main whose checks passed
+        type: string
+        required: true
+      target:
+        description: One line of targets.txt, for example services/mayfair-id
+        type: string
+        required: true
+      dry_run:
+        description: Deploy only. Build without uploading (leave on for a rehearsal)
+        type: boolean
+        default: true
+      version_id:
+        description: Rollback only. The Worker version id to go back to
+        type: string
+        required: false
+        default: ''
+      reason:
+        description: Why, for the record
+        type: string
+        required: true
+permissions: {}
+concurrency:
+  group: mayfair-production
+  cancel-in-progress: false
+jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Check the request and show it for approval
+        env:
+          OWN_TOKEN: ${{ github.token }}
+          ACTION: ${{ inputs.action }}
+          COMMIT: ${{ inputs.commit }}
+          TARGET: ${{ inputs.target }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          VERSION_ID: ${{ inputs.version_id }}
+          REASON: ${{ inputs.reason }}
+        run: |
+          set -euo pipefail
+          fail() { echo "REFUSED: $1" >&2; printf 'Refused: %s\n' "$1" >> "$GITHUB_STEP_SUMMARY"; exit 1; }
+          [ "$GITHUB_REF" = "refs/heads/main" ] || fail "start this workflow from main of mayfair-deploy"
+          case "$ACTION" in deploy|rollback) ;; *) fail "action must be deploy or rollback";; esac
+          printf '%s' "$COMMIT" | grep -Eq '^[0-9a-f]{40}$' || fail "commit must be 40 lowercase hex characters"
+          printf '%s' "$TARGET" | grep -Eq '^[a-z0-9][a-z0-9-]*(/[a-z0-9][a-z0-9-]*)*$' || fail "target has the wrong shape"
+          if [ "$ACTION" = rollback ]; then
+            printf '%s' "$VERSION_ID" | grep -Eq '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' || fail "rollback needs a version id"
+          fi
+          [ -n "$REASON" ] || fail "give a reason"
+          GH_TOKEN="$OWN_TOKEN" gh api -H "Accept: application/vnd.github.raw" "repos/$GITHUB_REPOSITORY/contents/targets.txt?ref=$GITHUB_SHA" > "$RUNNER_TEMP/targets.txt" || fail "cannot read targets.txt"
+          grep -Fxq -- "$TARGET" "$RUNNER_TEMP/targets.txt" || fail "target is not listed in targets.txt"
+          {
+            echo "### Production request, waiting for the owner"
+            echo ""
+            echo "| Item | Value |"
+            echo "|---|---|"
+            echo "| Action | $ACTION |"
+            echo "| Commit | $COMMIT |"
+            echo "| Target | $TARGET |"
+            echo "| Dry run | $DRY_RUN |"
+            echo "| Version id | ${VERSION_ID:-none} |"
+            echo "| Reason | $REASON |"
+            echo ""
+            echo "Approve only if you started this run yourself and the commit is the one you meant."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    name: deploy
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: production
+    permissions:
+      contents: read
+    env:
+      ACTION: ${{ inputs.action }}
+      COMMIT: ${{ inputs.commit }}
+      TARGET: ${{ inputs.target }}
+      VERSION_ID: ${{ inputs.version_id }}
+      REASON: ${{ inputs.reason }}
+    steps:
+      - name: Verify the commit in mayfair
+        env:
+          GH_TOKEN: ${{ secrets.MAYFAIR_READ_TOKEN }}
+          OWN_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          fail() { echo "REFUSED: $1" >&2; printf 'Refused: %s\n' "$1" >> "$GITHUB_STEP_SUMMARY"; exit 1; }
+          [ -n "${GH_TOKEN:-}" ] || fail "MAYFAIR_READ_TOKEN is not set in the production environment"
+          api="repos/mayfairorg/mayfair"
+          st=$(gh api "$api/compare/$COMMIT...main" --jq .status) || fail "cannot read mayfair with the read token"
+          case "$st" in identical|ahead) ;; *) fail "commit is not on main of mayfair (status $st)";; esac
+          n=$(gh api "$api/commits/$COMMIT/pulls" --jq '[.[] | select(.merged_at != null and .base.ref == "main")] | length') || fail "cannot list pull requests"
+          [ "$n" -ge 1 ] || fail "commit did not arrive through a merged pull request"
+          GH_TOKEN="$OWN_TOKEN" gh api -H "Accept: application/vnd.github.raw" "repos/$GITHUB_REPOSITORY/contents/required-checks.txt?ref=$GITHUB_SHA" | sed 's/#.*//' | awk 'NF' > "$RUNNER_TEMP/required.txt" || fail "cannot read required-checks.txt"
+          [ -s "$RUNNER_TEMP/required.txt" ] || fail "required-checks.txt lists no checks"
+          gh api --paginate "$api/commits/$COMMIT/check-runs?per_page=100&filter=latest" --jq '.check_runs[] | [.name, .status, (.conclusion // "none")] | @tsv' > "$RUNNER_TEMP/runs.tsv" || fail "cannot read check runs"
+          [ -s "$RUNNER_TEMP/runs.tsv" ] || fail "the commit has no check runs"
+          bad=$(awk -F'\t' '!($2 == "completed" && ($3 == "success" || $3 == "skipped" || $3 == "neutral")) {print $1}' "$RUNNER_TEMP/runs.tsv")
+          [ -z "$bad" ] || fail "checks not green: $(printf '%s' "$bad" | tr '\n' ' ')"
+          while IFS= read -r name; do
+            awk -F'\t' -v n="$name" '$1 == n && $2 == "completed" && $3 == "success" {f = 1} END {exit !f}' "$RUNNER_TEMP/runs.tsv" || fail "required check missing or not passed: $name"
+          done < "$RUNNER_TEMP/required.txt"
+          echo "Commit $COMMIT is on main, merged by pull request, and every required check passed." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fetch the commit
+        env:
+          READ_TOKEN: ${{ secrets.MAYFAIR_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          b64=$(printf 'x-access-token:%s' "$READ_TOKEN" | base64 | tr -d '\n')
+          echo "::add-mask::$b64"
+          mkdir "$RUNNER_TEMP/src"
+          cd "$RUNNER_TEMP/src"
+          git init -q
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $b64" fetch -q --depth=1 https://github.com/mayfairorg/mayfair "$COMMIT"
+          git checkout -q --detach FETCH_HEAD
+          [ "$(git rev-parse HEAD)" = "$COMMIT" ] || { echo "REFUSED: fetched commit differs" >&2; exit 1; }
+
+      - name: Install the pinned dependencies (no secrets in this step, no install scripts)
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/src"
+          [ -f package-lock.json ] || { echo "REFUSED: no package-lock.json at the repository root" >&2; exit 1; }
+          [ -d "$TARGET" ] || { echo "REFUSED: target folder not found at this commit" >&2; exit 1; }
+          npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Dry run
+        if: inputs.action == 'deploy' && inputs.dry_run
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/src/$TARGET"
+          npx --no-install wrangler deploy --env production --dry-run
+          echo "Dry run of $TARGET at $COMMIT finished. Nothing was uploaded." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Deploy to production
+        if: inputs.action == 'deploy' && !inputs.dry_run
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_PROD_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CF_PROD_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/src/$TARGET"
+          npx --no-install wrangler deploy --env production
+          echo "Deployed $TARGET at $COMMIT to production. Reason: $REASON" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Roll back in production
+        if: inputs.action == 'rollback'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_PROD_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CF_PROD_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/src/$TARGET"
+          npx --no-install wrangler rollback "$VERSION_ID" --env production --yes
+          echo "Rolled $TARGET back to version $VERSION_ID. Reason: $REASON" >> "$GITHUB_STEP_SUMMARY"
