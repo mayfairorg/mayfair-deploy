@@ -1,0 +1,62 @@
+# Keeps the public mayfair-deploy repository to workflow files and two lists (OD190, OD192).
+# It has no secrets and no third party actions. It runs on every push to main and every pull request.
+name: repo-check
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  check:
+    name: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check the tree
+        env:
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          fail() { echo "FINDING: $1" >&2; bad=1; }
+          bad=0
+          mkdir "$RUNNER_TEMP/t" && cd "$RUNNER_TEMP/t"
+          git init -q
+          git fetch -q --depth=1 "https://github.com/$REPO" "$SHA"
+          git checkout -q --detach FETCH_HEAD
+          # 1. only allowed files
+          while IFS= read -r f; do
+            case "$f" in
+              README.md|targets.txt|required-checks.txt|LICENSE) ;;
+              .github/workflows/*.yml) ;;
+              *) fail "file not allowed in this repository: $f";;
+            esac
+          done < <(git ls-files)
+          wf=$(git ls-files '.github/workflows/*.yml')
+          # 2. no risky triggers, and the deploy workflow starts only by hand
+          # shellcheck disable=SC2086
+          if grep -nE 'pull_request''_target|workflow''_run|issue''_comment|^\s*schedule:|repository''_dispatch' $wf; then fail "risky trigger"; fi
+          if [ -f .github/workflows/deploy-production.yml ]; then
+            if grep -nE '^\s*(push|pull_request):' .github/workflows/deploy-production.yml; then fail "deploy workflow must start only by hand"; fi
+            grep -q 'workflow_dispatch:' .github/workflows/deploy-production.yml || fail "deploy workflow has no manual start"
+            grep -q 'environment: production' .github/workflows/deploy-production.yml || fail "deploy job lacks the production environment"
+          fi
+          # 3. no actions at all
+          # shellcheck disable=SC2086
+          if grep -nE '^\s*(-\s*)?uses:' $wf; then fail "actions are not allowed, use plain commands"; fi
+          # 4. expressions only in env mappings, names, conditions and groups
+          # shellcheck disable=SC2086
+          if grep -n '\$''{{' $wf | grep -vE ':\s+[A-Z_0-9]+: \$\{\{ (inputs|secrets|vars|github)\.[A-Za-z_]+ \}\}$' | grep -vE ':\s*(run-name|group|if|REPO|SHA):' | grep -vE ':\s+if: ' ; then fail "expression outside an env mapping"; fi
+          # 5. secret names
+          # shellcheck disable=SC2086
+          for s in $(grep -ohE 'secrets\.[A-Za-z_0-9]+' $wf | sort -u); do
+            case "$s" in secrets.MAYFAIR_READ_TOKEN|secrets.CF_PROD_API_TOKEN) ;; *) fail "unexpected secret $s";; esac
+          done
+          # 6. no secret shaped text, no dash characters
+          # shellcheck disable=SC2046
+          if grep -nE 'github_''pat_|gh''p_|gh''o_|AK''IA|BEGIN [A-Z ]*PRIVATE'' KEY' $(git ls-files); then fail "secret shaped text"; fi
+          # shellcheck disable=SC2046
+          if grep -nP '\x{2013}|\x{2014}' $(git ls-files); then fail "dash character"; fi
+          [ "$bad" -eq 0 ] && echo "No findings"
+          exit "$bad"
